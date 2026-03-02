@@ -213,7 +213,7 @@ def render() -> None:
             )
             st.dataframe(df_cats, width="stretch")
 
-            fig = px.bar(df_cats, x="category", y="count", title="OSM amenities (nodes) by category")
+            fig = px.bar(df_cats, x="category", y="count", title="OSM amenities by category")
             st.plotly_chart(fig, width="stretch")
         else:
             st.info("No category breakdown found in QA report.")
