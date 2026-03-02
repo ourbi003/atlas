@@ -16,26 +16,26 @@ class Artifact:
     mime: str
 
 
-def _fmt_bytes(n: int) -> str:
-    # simple human-readable formatter
-    for unit in ["B", "KB", "MB", "GB"]:
-        if n < 1024 or unit == "GB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n/1024:.2f} {unit}"
-        n //= 1  # no-op for clarity
-    return f"{n} B"
+def _pretty_path(path: Path) -> str:
+    """Display paths relative to repo root when possible."""
+    try:
+        return str(path.relative_to(CFG.repo_root))
+    except ValueError:
+        return str(path)
+
+
+def _human_bytes(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size/1024:.1f} KB"
+    return f"{size/(1024*1024):.2f} MB"
 
 
 def _file_meta(path: Path) -> str:
     stat = path.stat()
-    size = stat.st_size
+    size_str = _human_bytes(stat.st_size)
     mtime = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-    # size formatting (keep simple/consistent)
-    if size < 1024:
-        size_str = f"{size} B"
-    elif size < 1024 * 1024:
-        size_str = f"{size/1024:.1f} KB"
-    else:
-        size_str = f"{size/(1024*1024):.2f} MB"
     return f"{size_str} • modified {mtime}"
 
 
@@ -45,17 +45,19 @@ def _read_bytes(path: Path) -> bytes:
 
 
 def _artifact_card(a: Artifact) -> None:
+    exists = a.path.exists()
+
     col1, col2 = st.columns([3, 2])
     with col1:
         st.markdown(f"**{a.label}**")
-        st.code(str(a.path.relative_to(CFG.repo_root)) if a.path.is_absolute() else str(a.path), language="text")
-        if a.path.exists():
+        st.code(_pretty_path(a.path), language="text")
+        if exists:
             st.caption(_file_meta(a.path))
         else:
             st.warning("File not found. Run the pipeline refresh to generate it.")
 
     with col2:
-        if a.path.exists():
+        if exists:
             st.download_button(
                 label="Download",
                 data=_read_bytes(a.path),
