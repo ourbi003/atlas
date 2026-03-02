@@ -30,6 +30,25 @@ The app provides:
 - **QA / QC**: report browsing + validation summaries + outside-tract POI map
 - **Downloads**: one-click download of generated artifacts
 
+
+## Screenshots
+
+
+
+<h3 align="center">Map Explorer — Choropleth</h3>
+<br><br>
+<img width="2722" height="962" alt="image" src="https://github.com/user-attachments/assets/86b0b4f8-9532-4121-b112-3d175690a511" />
+
+*Coverage distribution for Palm Beach County (099): number of tracts by `coverage_score` (0–3) using the default category taxonomy.*
+
+<br><br>
+
+<h3 align="center">Map Explorer — Choropleth</h3>
+<br><br>
+<img width="2724" height="1356" alt="image" src="https://github.com/user-attachments/assets/f9c6bf0c-a3a9-4bff-a637-d219d84a8587" />
+
+*Map Explorer: Miami-Dade (086) choropleth of `buffer_amenities_per_km2_total` (buffer-based amenity density) where tracts contain at least 4 amenities and tracts larger than ~725 km2 are excluded.*
+
 ---
 
 ## Intended purpose + inference guide (read this first)
