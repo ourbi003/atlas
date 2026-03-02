@@ -19,6 +19,7 @@ def tiger_tract_zip_url(*, year: int, state_fips: str) -> str:
     https://www2.census.gov/geo/tiger/TIGER2023/TRACT/tl_2023_12_tract.zip
     """
     return f"{CFG.tiger_base_url}/TIGER{year}/TRACT/tl_{year}_{state_fips}_tract.zip"
+    
 
 def tiger_county_zip_url(*, year: int) -> str:
     """
