@@ -4,49 +4,26 @@ import streamlit as st
 
 from atlas.config import CFG
 
-def _render_page(page: str) -> None:
-    """
-    Route to the selected page module.
-    Each page module must expose a `render()` function.
-    """
-    if page == "Home":
-        from atlas.app import home
-        home.render()
-        return
-
-    if page == "Map Explorer":
-        from atlas.app.pages import map_explorer
-        map_explorer.render()
-        return
-
-    if page == "QA / QC":
-        from atlas.app.pages import qa_qc
-        qa_qc.render()
-        return
-
-    if page == "Downloads":
-        from atlas.app.pages import downloads
-        downloads.render()
-        return
-
-    st.error(f"Unknown page selection: {page}")
-
 
 def main() -> None:
-    # Must be called exactly once, and before any other Streamlit calls.
     st.set_page_config(page_title="Atlas", layout="wide")
 
     st.sidebar.title("Atlas")
     st.sidebar.caption(getattr(CFG, "region_label", "Urban + GIS Analytics"))
 
-    page = st.sidebar.radio(
-        "Navigate",
-        options=("Home", "Map Explorer", "QA / QC", "Downloads"),
-        index=0,
-    )
+    pages = {
+        "Home": ("atlas.app.home", "render"),
+        "Map Explorer": ("atlas.app.pages.map_explorer", "render"),
+        "QA / QC": ("atlas.app.pages.qa_qc", "render"),
+        "Downloads": ("atlas.app.pages.downloads", "render"),
+    }
+
+    page = st.sidebar.radio("Navigate", options=tuple(pages.keys()), index=0)
 
     try:
-        _render_page(page)
+        module_path, fn_name = pages[page]
+        mod = __import__(module_path, fromlist=[fn_name])
+        getattr(mod, fn_name)()
     except ModuleNotFoundError as e:
         st.error(
             "A required page module could not be imported.\n\n"
