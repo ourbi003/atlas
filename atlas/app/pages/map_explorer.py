@@ -10,57 +10,13 @@ import streamlit.components.v1 as components
 
 from atlas.config import CFG
 
-def _norm_county_fips(v: object) -> str:
-    """
-    Normalize county FIPS to 3-digit string for stable UI labels and filtering.
-    Handles values like 86, '86', '086', and '86.0'.
-    """
-    if pd.isna(v):
-        return ""
-
-    s = str(v).strip()
-    if s.endswith(".0"):
-        s = s[:-2]
-
-    return s.zfill(3) if s.isdigit() else s
-
-def _county_name_map_from_df(df: pd.DataFrame) -> dict[str, str]:
-    """
-    Build a county_fips -> county_name map from an artifact dataframe if available.
-    """
-    if "county_fips" not in df.columns or "county_name" not in df.columns:
-        return {}
-
-    tmp = df[["county_fips", "county_name"]].copy()
-    tmp["county_fips"] = tmp["county_fips"].map(_norm_county_fips)
-    tmp["county_name"] = tmp["county_name"].astype(str).str.strip()
-
-    tmp = tmp[
-        (tmp["county_fips"] != "")
-        & (tmp["county_name"] != "")
-        & (tmp["county_name"].str.lower() != "nan")
-    ].drop_duplicates(subset=["county_fips"])
-
-    return dict(zip(tmp["county_fips"], tmp["county_name"]))
-
-def _county_label(fips: str) -> str:
-    fips3 = _norm_county_fips(fips)
-    raw_names = getattr(CFG, "county_names", {}) or {}
-    county_names = {_norm_county_fips(k): v for k, v in raw_names.items()}
-    name = county_names.get(fips3)
-    return f"{name or fips3} ({fips3})"
-
-
-def _require_artifact(path: Path, *, label: str) -> None:
-    if not path.exists():
-        st.error(
-            f"Missing required artifact: `{path}` ({label}).\n\n"
-            "Run the pipeline first:\n"
-            "```bash\n"
-            ".venv/bin/python -m atlas.pipeline.refresh\n"
-            "```"
-        )
-        st.stop()
+from atlas.app.ui_helpers import (
+    norm_county_fips,
+    county_name_map_from_df,
+    merge_county_name_maps,
+    format_county_option,
+    require_artifact,
+)
 
 
 @st.cache_data(show_spinner=False)
@@ -86,22 +42,18 @@ def _numeric_metrics(gdf: gpd.GeoDataFrame) -> list[str]:
         "buffer_access_score",
         "buffer_amenity_total",
         "buffer_amenities_per_km2_total",
-
         # Legacy tract-inside metrics
         "coverage_score",
         "amenity_total",
         "amenities_per_km2_total",
-
         # Per-category legacy counts
         "count_groceries",
         "count_pharmacy",
         "count_parks",
-
         # Per-category buffer counts (if present)
         "buffer_count_groceries",
         "buffer_count_pharmacy",
         "buffer_count_parks",
-
         # Geometry/context
         "area_km2",
         "buffer_area_km2",
@@ -175,23 +127,26 @@ def render() -> None:
     st.caption(f"Interactive exploration of tract-level access metrics for {region_label}.")
 
     tracts_geojson = CFG.curated_dir / "mart_access_tracts.geojson"
-    _require_artifact(tracts_geojson, label="Modeled tracts GeoJSON (mart_access_tracts.geojson)")
+    require_artifact(tracts_geojson, label="Modeled tracts GeoJSON (mart_access_tracts.geojson)")
 
     gdf = _load_tracts_geojson(tracts_geojson)
-    # Normalize county_fips for consistent labels/filtering across data sources
-    artifact_county_names = _county_name_map_from_df(gdf)
-    cfg_county_names = {
-        _norm_county_fips(k): v
-        for k, v in (getattr(CFG, "county_names", {}) or {}).items()
-    }
-    county_label_map = {**cfg_county_names, **artifact_county_names}  # artifact wins
 
-    # Minimum schema checks
     required = {"tract_geoid", "county_fips", "tract_name", "geometry"}
     missing = required - set(gdf.columns)
     if missing:
         st.error(f"`mart_access_tracts.geojson` missing expected columns: {sorted(missing)}")
         st.stop()
+
+    # Normalize county_fips ONCE for stable UI + filtering (prevents int/float mismatches)
+    gdf = gdf.copy()
+    gdf["county_fips"] = gdf["county_fips"].map(norm_county_fips)
+
+    # Build county label map (CFG + artifact; artifact wins if present)
+    artifact_county_names = county_name_map_from_df(gdf)
+    county_label_map = merge_county_name_maps(
+        cfg_names=getattr(CFG, "county_names", None),
+        artifact_names=artifact_county_names,
+    )
 
     metrics = _numeric_metrics(gdf)
     if not metrics:
@@ -201,37 +156,29 @@ def render() -> None:
     # Sidebar controls
     st.sidebar.header("Map filters")
 
-    county_options = ["ALL"] + sorted(gdf["county_fips"].dropna().astype(str).unique().tolist())
+    county_options = ["ALL"] + sorted(gdf["county_fips"].dropna().unique().tolist())
     county_choice = st.sidebar.selectbox(
         "County",
         options=county_options,
-        format_func=lambda x: (
-            "All counties"
-            if x == "ALL"
-            else f"{county_label_map.get(_norm_county_fips(x), _norm_county_fips(x))} ({_norm_county_fips(x)})"
-        ),
+        format_func=lambda x: format_county_option(x, county_label_map),
         index=0,
     )
 
     default_metric_candidates = [
-        "buffer_amenities_per_km2_total",  # preferred if buffer metrics exist
+        "buffer_amenities_per_km2_total",
         "buffer_access_score",
-        "amenities_per_km2_total",         # legacy fallback
+        "amenities_per_km2_total",
         "amenity_total",
         "coverage_score",
     ]
     default_metric = next((m for m in default_metric_candidates if m in metrics), metrics[0])
-    default_index = metrics.index(default_metric)
-
-    metric = st.sidebar.selectbox("Metric", options=metrics, index=default_index)
+    metric = st.sidebar.selectbox("Metric", options=metrics, index=metrics.index(default_metric))
 
     min_score = 0
     if "coverage_score" in gdf.columns:
         max_score = len(getattr(CFG, "osm_categories", {})) or 3
-        # (optional) guard: if data contains a higher score, let the slider reach it
         observed = int(pd.to_numeric(gdf["coverage_score"], errors="coerce").fillna(0).max())
         max_score = max(max_score, observed)
-
         min_score = int(st.sidebar.slider("Min coverage score", 0, max_score, 0))
 
     min_total = 0
@@ -244,18 +191,13 @@ def render() -> None:
     max_area_km2_filter: float | None = None
 
     if "area_km2" in gdf.columns:
-        # Base area slider on county selection only (before min_score/min_total), so it's easy to reason about
-        area_scope = gdf.copy()
-        if county_choice != "ALL":
-            area_scope = area_scope[area_scope["county_fips"] == county_choice].copy()
-
+        area_scope = gdf if county_choice == "ALL" else gdf[gdf["county_fips"] == county_choice]
         area_series = pd.to_numeric(area_scope["area_km2"], errors="coerce").dropna()
         if not area_series.empty:
             p95_area = float(area_series.quantile(0.95))
             max_area_observed = float(area_series.max())
 
             hide_large_tracts = st.sidebar.checkbox("Hide very large tracts", value=False)
-
             if hide_large_tracts:
                 slider_max = max(max_area_observed, 1.0)
                 slider_default = min(max(p95_area, 0.0), slider_max)
@@ -289,9 +231,7 @@ def render() -> None:
         view = view[pd.to_numeric(view["amenity_total"], errors="coerce").fillna(0) >= min_total].copy()
 
     if hide_large_tracts and max_area_km2_filter is not None and "area_km2" in view.columns:
-        view = view[
-            pd.to_numeric(view["area_km2"], errors="coerce").fillna(float("inf")) <= max_area_km2_filter
-        ].copy()
+        view = view[pd.to_numeric(view["area_km2"], errors="coerce").fillna(float("inf")) <= max_area_km2_filter].copy()
 
     # KPIs
     c1, c2, c3 = st.columns(3)
@@ -314,32 +254,29 @@ def render() -> None:
         max_score = len(getattr(CFG, "osm_categories", {})) or 3
         st.markdown(
             f"""
-    **coverage_score (0–{max_score})** is a *category presence* proxy per tract.
+**coverage_score (0–{max_score})** is a *category presence* proxy per tract.
 
-    - **1 point per category** if the tract contains **≥1** OpenStreetMap POI **node** for that category.
-    - This is **not** travel-time access. Dense areas can score lower if some categories are missing as nodes, while very large tracts can score higher if they contain at least one POI in each category.
-
-    For “15-minute access” semantics, use buffer/isochrone-based metrics (planned upgrade).
-    """
+- **1 point per category** if the tract contains **≥1** OpenStreetMap POI **node** for that category.
+- This is **not** travel-time access. Dense areas can score lower if some categories are missing as nodes, while very large tracts can score higher if they contain at least one POI in each category.
+"""
         )
 
     if "buffer_access_score" in view.columns:
-            with st.expander("How to interpret buffer_access_score (15-minute proxy)", expanded=False):
-                buf_max_score = max(
-                    len(getattr(CFG, "osm_categories", {})) or 3,
-                    int(pd.to_numeric(view["buffer_access_score"], errors="coerce").fillna(0).max()),
-                )
-                buffer_meters = getattr(CFG, "buffer_meters", 800)
+        with st.expander("How to interpret buffer_access_score (15-minute proxy)", expanded=False):
+            buf_max_score = max(
+                len(getattr(CFG, "osm_categories", {})) or 3,
+                int(pd.to_numeric(view["buffer_access_score"], errors="coerce").fillna(0).max()),
+            )
+            buffer_meters = getattr(CFG, "buffer_meters", 800)
+            st.markdown(
+                f"""
+**buffer_access_score (0–{buf_max_score})** is a *nearby access proxy* per tract.
 
-                st.markdown(
-                    f"""
-    **buffer_access_score (0–{buf_max_score})** is a *nearby access proxy* per tract.
+- **1 point per category** if at least one POI is within **{buffer_meters:,} m** of the tract centroid.
+- This usually aligns better with intuition than “inside tract polygon” for dense urban areas.
 
-    - **1 point per category** if at least one POI is within **{buffer_meters:,} m** of the tract centroid.
-    - This usually aligns better with intuition than “inside tract polygon” for dense urban areas.
-
-    It is still an approximation (centroid + straight-line distance), not a street-network travel-time metric.
-    """
+It is still an approximation (centroid + straight-line distance), not a street-network travel-time metric.
+"""
             )
 
     # Map
