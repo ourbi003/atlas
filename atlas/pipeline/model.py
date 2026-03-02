@@ -21,6 +21,7 @@ class ModelOutputs:
     tracts_geojson: Path
     report_json: Path
 
+
 def _norm_county_fips_series(s: pd.Series) -> pd.Series:
     """
     Normalize county FIPS values to 3-digit strings.
@@ -28,6 +29,7 @@ def _norm_county_fips_series(s: pd.Series) -> pd.Series:
     """
     out = s.astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
     return out.str.zfill(3)
+
 
 def _assign_points_to_tracts_within(
     points_wgs: gpd.GeoDataFrame,
@@ -71,6 +73,7 @@ def _assign_points_to_tracts_within(
                 if pt.within(poly):
                     assigned = geoid
                     break
+
             assigned_geoids.append(assigned)
 
         return pd.Series(assigned_geoids, index=points_wgs.index, dtype="object")
@@ -83,15 +86,18 @@ def build_access_mart(*, drop_unassigned_points: bool = True) -> ModelOutputs:
     - densities per km^2 (using tract area)
     - simple coverage_score = number of categories present (0..N)
 
+    Also computes centroid-buffer ("15-minute proxy") metrics:
+    - buffer_access_score, buffer_amenity_total, buffer_amenities_per_km2_total, etc.
+
     Inputs (curated):
-    - data/curated/dim_tracts.geojson
-    - data/curated/fact_amenities.geojson
+    - data/curated/.../dim_tracts.geojson
+    - data/curated/.../fact_amenities.geojson
 
     Outputs (modeled):
-    - data/curated/mart_access_long.csv
-    - data/curated/mart_access_wide.csv
-    - data/curated/mart_access_tracts.geojson
-    - data/curated/model_report.json
+    - data/curated/.../mart_access_long.csv
+    - data/curated/.../mart_access_wide.csv
+    - data/curated/.../mart_access_tracts.geojson
+    - data/curated/.../model_report.json
     """
     ensure_dir(CFG.curated_dir)
 
@@ -120,7 +126,7 @@ def build_access_mart(*, drop_unassigned_points: bool = True) -> ModelOutputs:
     require_crs(tracts, name="dim_tracts")
     require_crs(amenities, name="fact_amenities")
 
-    # Ensure WGS84 for spatial join (both already should be EPSG:4326 from ingestion)
+    # Ensure WGS84 for web mapping + stable joins
     tracts_wgs = tracts.to_crs("EPSG:4326") if str(tracts.crs) != "EPSG:4326" else tracts
     amenities_wgs = amenities.to_crs("EPSG:4326") if str(amenities.crs) != "EPSG:4326" else amenities
 
@@ -133,7 +139,47 @@ def build_access_mart(*, drop_unassigned_points: bool = True) -> ModelOutputs:
     tracts_proj = tracts_wgs.to_crs(CFG.projected_crs)
     tracts_proj["area_km2"] = tracts_proj.geometry.area / 1_000_000.0
 
-    # Assign points -> tract
+    # Categories + tract dimension table (include county_name if present)
+    categories = sorted(list(CFG.osm_categories.keys()))
+    tract_dim_cols = ["tract_geoid", "county_fips"]
+    if "county_name" in tracts_proj.columns:
+        tract_dim_cols.append("county_name")
+    tract_dim_cols.extend(["tract_name", "area_km2"])
+
+    all_tracts = tracts_proj[tract_dim_cols].copy()
+    tract_geoids = all_tracts["tract_geoid"].tolist()
+
+    # Build full tract x category grid ONCE (used for both legacy and buffer metrics)
+    full_index = pd.MultiIndex.from_product(
+        [tract_geoids, categories],
+        names=["tract_geoid", "category"],
+    )
+
+    def _fill_full_grid(counts_df: pd.DataFrame) -> pd.DataFrame:
+        """Ensure a complete tract×category grid with missing values filled as 0."""
+        return (
+            counts_df.set_index(["tract_geoid", "category"])
+            .reindex(full_index, fill_value=0)
+            .reset_index()
+        )
+
+    def _pivot_counts(counts_df_full: pd.DataFrame, *, prefix: str) -> pd.DataFrame:
+        """Pivot amenity_count into wide columns, renaming category columns with a prefix."""
+        wide = (
+            counts_df_full.pivot_table(
+                index="tract_geoid",
+                columns="category",
+                values="amenity_count",
+                aggfunc="sum",
+                fill_value=0,
+            )
+            .reset_index()
+        )
+        return wide.rename(columns={c: f"{prefix}{c}" for c in categories})
+
+    # -------------------------
+    # Legacy: point-in-polygon (within tract)
+    # -------------------------
     tract_geoid_series = _assign_points_to_tracts_within(
         points_wgs=amenities_wgs[["geometry"]].copy(),
         tracts_wgs=tracts_wgs[["tract_geoid", "geometry"]].copy(),
@@ -150,7 +196,6 @@ def build_access_mart(*, drop_unassigned_points: bool = True) -> ModelOutputs:
     else:
         amenities_in_scope = amenities_with_tract.copy()
 
-    # Aggregate: counts per tract/category (long)
     counts_long = (
         amenities_in_scope.groupby(["tract_geoid", "category"])
         .size()
@@ -158,20 +203,34 @@ def build_access_mart(*, drop_unassigned_points: bool = True) -> ModelOutputs:
         .reset_index()
     )
 
-    # Ensure we have full tract x category grid (fill missing with 0)
-    categories = sorted(list(CFG.osm_categories.keys()))
-    tract_dim_cols = ["tract_geoid", "county_fips"]
-    if "county_name" in tracts_proj.columns:
-        tract_dim_cols.append("county_name")
-    tract_dim_cols.extend(["tract_name", "area_km2"])
+    counts_long_full = _fill_full_grid(counts_long)
 
-    all_tracts = tracts_proj[tract_dim_cols].copy()
+    # Long output: add tract attributes (area + names) onto long table
+    long_df = counts_long_full.merge(all_tracts, on="tract_geoid", how="left")
+    long_df["amenities_per_km2"] = long_df["amenity_count"] / long_df["area_km2"].replace({0: pd.NA})
+    long_df["has_amenity"] = long_df["amenity_count"] > 0
 
-    # --- Buffer-based access proxy (within CFG.buffer_meters of tract centroid) ---
-    # NOTE: Requires CFG.buffer_meters (e.g., 800.0) to be defined in config.
+    # Wide output (legacy)
+    wide_counts = _pivot_counts(counts_long_full, prefix="count_")
+
+    for c in categories:
+        col = f"count_{c}"
+        wide_counts[f"has_{c}"] = wide_counts[col] > 0
+
+    has_cols = [f"has_{c}" for c in categories]
+    wide_counts["coverage_score"] = wide_counts[has_cols].sum(axis=1).astype(int)
+
+    count_cols = [f"count_{c}" for c in categories]
+    wide_counts["amenity_total"] = wide_counts[count_cols].sum(axis=1).astype(int)
+
+    wide_df = all_tracts.merge(wide_counts, on="tract_geoid", how="left")
+    wide_df["amenities_per_km2_total"] = wide_df["amenity_total"] / wide_df["area_km2"].replace({0: pd.NA})
+
+    # -------------------------
+    # Buffer-based access proxy (within CFG.buffer_meters of tract centroid)
+    # -------------------------
     amenities_proj = amenities_wgs.to_crs(CFG.projected_crs)
 
-    # Buffer around centroid in projected CRS (meters)
     buffers = tracts_proj[["tract_geoid", "geometry"]].copy()
     buffers["geometry"] = tracts_proj.geometry.centroid.buffer(CFG.buffer_meters)
 
@@ -189,8 +248,6 @@ def build_access_mart(*, drop_unassigned_points: bool = True) -> ModelOutputs:
             .reset_index()
         )
     except (ImportError, ModuleNotFoundError, ValueError, TypeError):
-        # Fallback: brute force assignment (OK for MVP sizes)
-        # _assign_points_to_tracts_within() works as long as both inputs share the same CRS.
         tract_geoid_buf = _assign_points_to_tracts_within(
             points_wgs=amenities_proj[["geometry"]].copy(),
             tracts_wgs=buffers[["tract_geoid", "geometry"]].copy(),
@@ -205,33 +262,9 @@ def build_access_mart(*, drop_unassigned_points: bool = True) -> ModelOutputs:
             .reset_index()
         )
 
-    # Build full tract x category grid (fill missing with 0)
-    full_index_buf = pd.MultiIndex.from_product(
-        [all_tracts["tract_geoid"].tolist(), categories],
-        names=["tract_geoid", "category"],
-    )
+    counts_buf_full = _fill_full_grid(counts_buf)
+    buf_wide = _pivot_counts(counts_buf_full, prefix="buffer_count_")
 
-    counts_buf_full = (
-        counts_buf.set_index(["tract_geoid", "category"])
-        .reindex(full_index_buf, fill_value=0)
-        .reset_index()
-    )
-
-    buf_wide = (
-        counts_buf_full.pivot_table(
-            index="tract_geoid",
-            columns="category",
-            values="amenity_count",
-            aggfunc="sum",
-            fill_value=0,
-        )
-        .reset_index()
-    )
-
-    # Rename columns -> buffer_count_<category>
-    buf_wide = buf_wide.rename(columns={c: f"buffer_count_{c}" for c in categories})
-
-    # buffer_has_<category> and buffer_access_score
     for c in categories:
         col = f"buffer_count_{c}"
         buf_wide[f"buffer_has_{c}"] = buf_wide[col] > 0
@@ -242,66 +275,16 @@ def build_access_mart(*, drop_unassigned_points: bool = True) -> ModelOutputs:
     buf_wide["buffer_access_score"] = buf_wide[buf_has_cols].sum(axis=1).astype(int)
     buf_wide["buffer_amenity_total"] = buf_wide[buf_count_cols].sum(axis=1).astype(int)
 
-    # Density within the buffer area (constant per tract)
     buffer_area_km2 = math.pi * (CFG.buffer_meters ** 2) / 1_000_000.0
     buf_wide["buffer_area_km2"] = buffer_area_km2
     buf_wide["buffer_amenities_per_km2_total"] = buf_wide["buffer_amenity_total"] / buffer_area_km2
 
-    full_index = pd.MultiIndex.from_product(
-        [all_tracts["tract_geoid"].tolist(), categories],
-        names=["tract_geoid", "category"],
-    )
-    counts_long_full = (
-        counts_long.set_index(["tract_geoid", "category"])
-        .reindex(full_index, fill_value=0)
-        .reset_index()
-    )
-
-    # Join tract attributes (area + names) onto long table
-    long_df = counts_long_full.merge(all_tracts, on="tract_geoid", how="left")
-
-    # Density per km^2 (guard against tiny areas)
-    long_df["amenities_per_km2"] = long_df["amenity_count"] / long_df["area_km2"].replace({0: pd.NA})
-
-    # Coverage flag per category
-    long_df["has_amenity"] = long_df["amenity_count"] > 0
-
-    # Build wide table: one row per tract, columns per category count
-    wide_counts = (
-        long_df.pivot_table(
-            index="tract_geoid",
-            columns="category",
-            values="amenity_count",
-            aggfunc="sum",
-            fill_value=0,
-        )
-        .reset_index()
-    )
-
-    # Rename count columns to be explicit
-    wide_counts = wide_counts.rename(columns={c: f"count_{c}" for c in categories})
-
-    # Coverage score: number of categories present (0..N)
-    for c in categories:
-        col = f"count_{c}"
-        wide_counts[f"has_{c}"] = wide_counts[col] > 0
-
-    has_cols = [f"has_{c}" for c in categories]
-    wide_counts["coverage_score"] = wide_counts[has_cols].sum(axis=1).astype(int)
-
-    # Total counts + total density
-    count_cols = [f"count_{c}" for c in categories]
-    wide_counts["amenity_total"] = wide_counts[count_cols].sum(axis=1).astype(int)
-
-    # Join area/names for wide output
-    wide_df = all_tracts.merge(wide_counts, on="tract_geoid", how="left")
-    wide_df["amenities_per_km2_total"] = wide_df["amenity_total"] / wide_df["area_km2"].replace({0: pd.NA})
-
     # Merge buffer metrics into the main wide_df
     wide_df = wide_df.merge(buf_wide, on="tract_geoid", how="left")
 
-    # Build GeoJSON output: join metrics back to tract polygons (WGS84)
-    # Avoid duplicating tract dimension columns (county_fips, tract_name) which already exist on tracts_wgs.
+    # -------------------------
+    # Geo outputs
+    # -------------------------
     wide_metrics = wide_df.drop(columns=["county_fips", "county_name", "tract_name"], errors="ignore")
 
     tracts_out = tracts_wgs.merge(
