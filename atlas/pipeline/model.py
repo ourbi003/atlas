@@ -175,7 +175,7 @@ def build_access_mart(*, drop_unassigned_points: bool = True) -> ModelOutputs:
             )
             .reset_index()
         )
-        return wide.rename(columns={cat: f"{prefix}{c}" for cat in categories})
+        return wide.rename(columns={cat: f"{prefix}{cat}" for cat in categories})
 
     # -------------------------
     # Legacy: point-in-polygon (within tract)
